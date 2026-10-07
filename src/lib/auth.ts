@@ -42,3 +42,7 @@ export async function getCurrentUser(): Promise<UserTokenPayload | null> {
   if (!token) return null;
   return verifyToken(token);
 }
+
+export async function getAuthUser(req?: any): Promise<UserTokenPayload | null> {
+  return getCurrentUser();
+}

@@ -1,50 +1,100 @@
-import { NextResponse } from 'next/server';
-import { connectDB } from '@/lib/db';
+import { NextRequest, NextResponse } from 'next/server';
+import dbConnect from '@/lib/db';
 import Document from '@/models/Document';
-import { getCurrentUser } from '@/lib/auth';
-import crypto from 'crypto';
+import ActivityLog from '@/models/ActivityLog';
+import { getAuthUser } from '@/lib/auth';
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   try {
-    const currentUser = await getCurrentUser();
-    if (!currentUser) {
+    const authUser = await getAuthUser(req);
+    if (!authUser) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    await connectDB();
-    const documents = await Document.find({ ownerId: currentUser.userId })
-      .sort({ updatedAt: -1 })
-      .select('title roomId ownerId createdAt updatedAt');
+    await dbConnect();
+
+    const searchParams = req.nextUrl.searchParams;
+    const query = searchParams.get('q')?.trim() || '';
+    const filter = searchParams.get('filter') || 'all'; // 'all' | 'mine' | 'shared'
+
+    let mongoQuery: any = {};
+
+    if (filter === 'mine') {
+      mongoQuery = { ownerId: authUser.userId };
+    } else if (filter === 'shared') {
+      mongoQuery = {
+        ownerId: { $ne: authUser.userId },
+        'collaborators.email': authUser.email.toLowerCase(),
+      };
+    } else {
+      mongoQuery = {
+        $or: [{ ownerId: authUser.userId }, { 'collaborators.email': authUser.email.toLowerCase() }],
+      };
+    }
+
+    if (query) {
+      mongoQuery.title = { $regex: query, $options: 'i' };
+    }
+
+    const documents = await Document.find(mongoQuery).sort({ updatedAt: -1 }).lean();
 
     return NextResponse.json({ documents });
-  } catch (error: any) {
-    console.error('Error fetching documents:', error);
-    return NextResponse.json({ error: error.message || 'Failed to fetch documents' }, { status: 500 });
+  } catch (err) {
+    console.error('API /api/documents GET error:', err);
+    return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
   }
 }
 
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
   try {
-    const currentUser = await getCurrentUser();
-    if (!currentUser) {
+    const authUser = await getAuthUser(req);
+    if (!authUser) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
     const body = await req.json().catch(() => ({}));
-    const title = body.title || 'Untitled Document';
-    const roomId = body.roomId || crypto.randomUUID().slice(0, 8);
+    const title = body.title?.trim() || 'Untitled Document';
 
-    await connectDB();
+    await dbConnect();
+
+    // Generate clean room ID
+    const roomId = `room-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
 
     const newDoc = await Document.create({
       title,
-      ownerId: currentUser.userId,
+      ownerId: authUser.userId,
       roomId,
+      collaborators: [
+        {
+          userId: authUser.userId,
+          email: authUser.email.toLowerCase(),
+          role: 'OWNER',
+          addedAt: new Date(),
+        },
+      ],
+      versions: [
+        {
+          versionId: `ver-init-${Date.now()}`,
+          title: 'Initial Creation',
+          contentState: '',
+          createdBy: authUser.name,
+          createdAt: new Date(),
+        },
+      ],
     });
 
-    return NextResponse.json({ success: true, document: newDoc }, { status: 201 });
-  } catch (error: any) {
-    console.error('Error creating document:', error);
-    return NextResponse.json({ error: error.message || 'Failed to create document' }, { status: 500 });
+    // Log Activity
+    await ActivityLog.create({
+      roomId,
+      actorName: authUser.name,
+      actorEmail: authUser.email,
+      action: 'CREATED',
+      details: `Created document "${title}"`,
+    });
+
+    return NextResponse.json({ document: newDoc }, { status: 201 });
+  } catch (err) {
+    console.error('API /api/documents POST error:', err);
+    return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
   }
 }
